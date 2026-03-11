@@ -1,6 +1,22 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+let currentKeyIndex = 0;
+
+function getApiKeys() {
+  return (process.env.GOOGLE_API_KEY || '')
+    .split(',')
+    .map(k => k.trim())
+    .filter(k => k.length > 0);
+}
+
+function rotateApiKey() {
+  const keys = getApiKeys();
+  if (keys.length <= 1) return false;
+  
+  currentKeyIndex = (currentKeyIndex + 1) % keys.length;
+  console.log(`\n🔄 API Key limit reached! Auto-switching to API key ${currentKeyIndex + 1} of ${keys.length}...\n`);
+  return true;
+}
 
 /**
  * Parse a natural language question into a structured query plan using Gemini.
@@ -10,8 +26,6 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
  * @returns {Object} Structured plan: { chart_type, x_column, y_column, aggregation, group_by, filters, title, insight }
  */
 async function parseQuery(question, columns, conversationHistory = []) {
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
   const systemContext = `You are an expert data analyst and visualization specialist. You analyze datasets and generate structured query plans.
 
 Available dataset columns: ${columns.join(', ')}
@@ -73,10 +87,16 @@ Rules:
 - aggregation is "none" only for scatter charts with raw data
 - x_column and group_by are usually the same column`;
 
-  // Retry up to 2 times on rate limit (429)
+  // We allow retries to circle through all available keys before giving up
+  const maxAttempts = Math.max(3, getApiKeys().length + 1);
   let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
+      const currentKeys = getApiKeys();
+      const activeKey = currentKeys[currentKeyIndex] || 'MISSING_KEY';
+      const genAI = new GoogleGenerativeAI(activeKey);
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
       const result = await model.generateContent(prompt);
       const text = result.response.text().trim();
 
@@ -97,10 +117,21 @@ Rules:
       return { success: true, plan };
     } catch (err) {
       lastErr = err;
-      const is429 = err.message && err.message.includes('429');
-      if (is429 && attempt < 2) {
+      
+      // If the error is just our own JSON parsing validation, we don't need to rotate keys
+      if (err.message.includes('valid JSON') || err.message.includes('missing field')) {
+        break; 
+      }
+
+      // For any actual Gemini API error (404, 429, 500, quota, revoked, etc), rotate or backoff
+      const rotated = rotateApiKey();
+      if (rotated) {
+        // If we successfully rotated to a new key, don't wait - retry immediately!
+        continue;
+      } else if (attempt < 2) {
+        // If we couldn't rotate (only 1 key provided), wait and backoff like usual
         const wait = (attempt + 1) * 15000; // 15s, 30s
-        console.log(`⏳ Rate limited, retrying in ${wait / 1000}s...`);
+        console.log(`⏳ API error on single key, retrying in ${wait / 1000}s...`);
         await new Promise(r => setTimeout(r, wait));
         continue;
       }
